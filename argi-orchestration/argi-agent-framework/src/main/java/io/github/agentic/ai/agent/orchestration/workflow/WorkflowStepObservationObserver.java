@@ -35,8 +35,10 @@ import io.github.agentic.ai.workflow.graph.observation.trace.AgentTracer;
  * thread that started it.
  * <p>
  * The workflow engine emits enter/exit pairs on the executing thread (parallel branch
- * workers included), so enter/exit pairing is a per-thread LIFO stack here. The
- * workflow run identity is carried as the span's run id; with a disabled tracer the
+ * workers included), so enter/exit pairing is a per-thread LIFO stack here. Physical
+ * attempts of a step (issue #317) carry their own attempt identity and are ignored:
+ * the step span already covers the retried work, so a retry never opens a nested span.
+ * The workflow run identity is carried as the span's run id; with a disabled tracer the
  * observer still receives events but creates no observation, so leaving the workflow
  * unobserved preserves the historical behavior exactly.
  */
@@ -62,6 +64,9 @@ public final class WorkflowStepObservationObserver implements LifecycleObserver 
 
 	@Override
 	public void onEvent(LifecycleEvent event) {
+		if (isAttemptEvent(event)) {
+			return;
+		}
 		if (event instanceof LifecycleEvent.StageEntered entered) {
 			AgentTraceSpan span = startSpan(entered);
 			this.spans.get().push(span);
@@ -79,6 +84,16 @@ public final class WorkflowStepObservationObserver implements LifecycleObserver 
 			}
 			span.close();
 		}
+	}
+
+	private static boolean isAttemptEvent(LifecycleEvent event) {
+		if (event instanceof LifecycleEvent.StageEntered entered) {
+			return entered.identity().attempt() != null;
+		}
+		if (event instanceof LifecycleEvent.StageExited exited) {
+			return exited.identity().attempt() != null;
+		}
+		return false;
 	}
 
 	private AgentTraceSpan startSpan(LifecycleEvent.StageEntered entered) {

@@ -19,6 +19,14 @@ import io.github.agentic.ai.agent.Agent;
 import io.github.agentic.ai.agent.AgentEvent;
 import io.github.agentic.ai.agent.AgentExecutionContext;
 import io.github.agentic.ai.agent.AgentOutcome;
+import io.github.agentic.ai.agent.lifecycle.InvocationId;
+import io.github.agentic.ai.agent.lifecycle.LifecycleEmissions;
+import io.github.agentic.ai.agent.lifecycle.LifecycleEvent;
+import io.github.agentic.ai.agent.lifecycle.LifecycleIdentity;
+import io.github.agentic.ai.agent.lifecycle.LifecycleObserver;
+import io.github.agentic.ai.agent.lifecycle.LifecycleStage;
+import io.github.agentic.ai.agent.lifecycle.ModelTurnId;
+import io.github.agentic.ai.agent.lifecycle.ToolCallId;
 import io.github.agentic.ai.agent.AgentRequest;
 import io.github.agentic.ai.api.chat.ChatClient;
 import io.github.agentic.ai.api.chat.ChatEvent;
@@ -95,6 +103,8 @@ public final class ReActAgent implements Agent {
 
 	private final int maxTurns;
 
+	private final List<LifecycleObserver> observers;
+
 	private final boolean streamModel;
 
 	private final Function<Map<String, Object>, ToolRegistry> dynamicToolProvider;
@@ -113,6 +123,7 @@ public final class ReActAgent implements Agent {
 		this.outputFinalizer = builder.outputFinalizer;
 		this.outputSchema = builder.outputSchema;
 		this.maxTurns = builder.maxTurns;
+		this.observers = List.copyOf(builder.observers);
 		this.streamModel = builder.streamModel;
 		this.dynamicToolProvider = builder.dynamicToolProvider;
 	}
@@ -153,6 +164,8 @@ public final class ReActAgent implements Agent {
 		private String outputSchema;
 
 		private int maxTurns = 16;
+
+		private final List<LifecycleObserver> observers = new ArrayList<>();
 
 		private boolean streamModel;
 
@@ -222,6 +235,21 @@ public final class ReActAgent implements Agent {
 
 		public Builder outputFinalizer(StructuredOutputFinalizer outputFinalizer) {
 			this.outputFinalizer = outputFinalizer;
+			return this;
+		}
+
+		/**
+		 * Register lifecycle observers that receive the run/model-call/tool-call events
+		 * of this agent (issue #317). Observation is an explicit opt-in: with no
+		 * observers, execution behavior is preserved exactly.
+		 * @param observers the observers to append, must not be null
+		 * @return this builder
+		 */
+		public Builder observers(LifecycleObserver... observers) {
+			Objects.requireNonNull(observers, "observers must not be null");
+			for (LifecycleObserver observer : observers) {
+				this.observers.add(Objects.requireNonNull(observer, "observer must not be null"));
+			}
 			return this;
 		}
 
@@ -301,16 +329,44 @@ public final class ReActAgent implements Agent {
 			worker.start();
 		}
 
+		/** Terminal kind decided by the delivery path, never by the cleanup cancel. */
+		private volatile String terminalKind;
+
 		private void runSafely() {
+			// Run-level metrics semantics (issue #317): one RUN_START enter and one
+			// TERMINATION exit per delivery; the terminal kind travels as the exit reason
+			// (completed / suspended / cancelled / failed). The kind is decided by the
+			// delivery path, never by the subscription flag: the terminal collector's
+			// cleanup cancels the subscription after a normal completion too.
+			List<LifecycleObserver> bound = LifecycleEmissions.bound(observers, LifecycleStage.RUN_START);
+			LifecycleIdentity runIdentity = LifecycleIdentity
+				.builder(new InvocationId(context.trusted().runId()))
+				.build();
+			LifecycleEmissions.emitAll(bound, new LifecycleEvent.StageEntered(LifecycleStage.RUN_START, runIdentity),
+					runIdentity);
+			String terminal;
+			Throwable failure = null;
 			try {
 				run();
-				if (!cancelled.get()) {
-					subscriber.onComplete();
-				}
+				terminal = this.terminalKind == null ? "completed" : this.terminalKind;
 			}
 			catch (Throwable error) {
-				if (!cancelled.get()) {
-					subscriber.onError(error);
+				terminal = cancelled.get() ? "cancelled" : "failed";
+				failure = error;
+			}
+			// Emit the terminal event before signalling the caller: a completed future
+			// must observe the run already out of flight, and every terminal signal is
+			// delivered exactly once even when the subscription was cancelled.
+			List<LifecycleObserver> terminalBound = LifecycleEmissions.bound(observers, LifecycleStage.TERMINATION);
+			LifecycleEvent termination = new LifecycleEvent.StageExited(LifecycleStage.TERMINATION, runIdentity,
+					!"failed".equals(terminal) && !"cancelled".equals(terminal), terminal);
+			LifecycleEmissions.emitAll(terminalBound, termination, runIdentity);
+			if (!cancelled.get()) {
+				if (failure == null) {
+					subscriber.onComplete();
+				}
+				else {
+					subscriber.onError(failure);
 				}
 			}
 		}
@@ -345,7 +401,27 @@ public final class ReActAgent implements Agent {
 				context.control().assertActive();
 				ToolRegistry availableTools = resolveTools(state);
 				AtomicReference<ToolRegistry> effectiveTools = new AtomicReference<>(availableTools);
-				ChatResponse response = modelTurn(messages, state, usage, availableTools, effectiveTools, turn);
+				List<LifecycleObserver> modelBound = LifecycleEmissions.bound(observers, LifecycleStage.MODEL_CALL);
+				LifecycleIdentity turnIdentity = LifecycleIdentity
+					.builder(new InvocationId(context.trusted().runId()))
+					.modelTurn(new ModelTurnId("turn-" + turn))
+					.build();
+				LifecycleEmissions.emitAll(modelBound,
+						new LifecycleEvent.StageEntered(LifecycleStage.MODEL_CALL, turnIdentity), turnIdentity);
+				ChatResponse response;
+				try {
+					response = modelTurn(messages, state, usage, availableTools, effectiveTools, turn);
+				}
+				catch (RuntimeException modelFailure) {
+					LifecycleEmissions.emitAll(modelBound,
+							new LifecycleEvent.StageExited(LifecycleStage.MODEL_CALL, turnIdentity, false,
+									modelFailure.getClass().getSimpleName() + ": " + modelFailure.getMessage()),
+							turnIdentity);
+					throw modelFailure;
+				}
+				LifecycleEmissions.emitAll(modelBound,
+						new LifecycleEvent.StageExited(LifecycleStage.MODEL_CALL, turnIdentity, true, null),
+						turnIdentity);
 				// The turn contract guarantees exactly one assistant message: direct
 				// responses are validated by ModelResponse, and interceptor-supplied
 				// streams are validated here, so the turn's complete snapshot and its
@@ -362,10 +438,31 @@ public final class ReActAgent implements Agent {
 					return;
 				}
 				for (ToolCall call : response.toolCalls()) {
-					ToolStep step = executeTool(call, messages, state, effectiveTools.get());
+					List<LifecycleObserver> toolBound = LifecycleEmissions.bound(observers, LifecycleStage.TOOL_CALL);
+					LifecycleIdentity toolIdentity = LifecycleIdentity
+						.builder(new InvocationId(context.trusted().runId()))
+						.toolCall(new ToolCallId(call.id()))
+						.build();
+					LifecycleEmissions.emitAll(toolBound,
+							new LifecycleEvent.StageEntered(LifecycleStage.TOOL_CALL, toolIdentity), toolIdentity);
+					ToolStep step;
+					try {
+						step = executeTool(call, messages, state, effectiveTools.get());
+					}
+					catch (RuntimeException toolFailure) {
+						LifecycleEmissions.emitAll(toolBound,
+								new LifecycleEvent.StageExited(LifecycleStage.TOOL_CALL, toolIdentity, false,
+										toolFailure.getClass().getSimpleName() + ": " + toolFailure.getMessage()),
+								toolIdentity);
+						throw toolFailure;
+					}
+					LifecycleEmissions.emitAll(toolBound,
+							new LifecycleEvent.StageExited(LifecycleStage.TOOL_CALL, toolIdentity, true, null),
+							toolIdentity);
 					if (step.suspension() != null) {
 						AgentOutcome outcome = new AgentOutcome(AgentOutcome.Status.SUSPENDED, messages, state,
 								usage.value(), step.suspension());
+						this.terminalKind = "suspended";
 						emit(new AgentEvent.Finished(outcome));
 						return;
 					}

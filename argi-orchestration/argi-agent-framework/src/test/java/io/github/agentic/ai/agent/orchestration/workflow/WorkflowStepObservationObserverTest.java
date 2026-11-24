@@ -16,11 +16,13 @@
 package io.github.agentic.ai.agent.orchestration.workflow;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.agentic.ai.agent.Agent;
 import io.github.agentic.ai.agent.AgentEvent;
@@ -111,6 +113,36 @@ class WorkflowStepObservationObserverTest {
 		assertThat(span.getName()).isEqualTo("argi.agent.workflow.step");
 		assertThat(span.getLowCardinalityKeyValue(AgentTraceKeys.SUCCESS).getValue()).isEqualTo("false");
 		assertThat(span.getLowCardinalityKeyValue(AgentTraceKeys.OUTCOME).getValue()).isEqualTo("failed");
+	}
+
+	@Test
+	void retriesNeverOpenAnExtraStepSpan() throws Exception {
+		AtomicInteger calls = new AtomicInteger();
+		Agent flaky = agent(request -> {
+			if (calls.incrementAndGet() == 1) {
+				throw new IllegalStateException("boom");
+			}
+			return AgentOutcome.completed(List.of(ChatMessage.assistant("done")), Map.of("value", "v"),
+					new Usage(1L, 1L, 2L));
+		});
+		WorkflowDefinition definition = new WorkflowDefinition("demo", "1",
+				List.of(new WorkflowStep.Agent("answer", "worker", Map.of(), null,
+						new WorkflowStep.RetryPolicy(2, Duration.ZERO))));
+		WorkflowAgent workflow = WorkflowAgent.builder(definition).agents(Map.of("worker", flaky))
+			.observers(observer())
+			.build();
+
+		try (AgentExecutionContext context = context()) {
+			AgentOutcome outcome = workflow
+				.invoke(new AgentRequest(List.of(ChatMessage.user("hello")), Map.of(), null), context)
+				.get(3, TimeUnit.SECONDS);
+			assertThat(outcome.status()).isEqualTo(AgentOutcome.Status.COMPLETED);
+		}
+
+		// The physical second attempt (issue #317) must not open a nested step span.
+		assertThat(this.handler.stopped).hasSize(1);
+		Observation.Context span = this.handler.stopped.get(0);
+		assertThat(span.getLowCardinalityKeyValue(AgentTraceKeys.SUCCESS).getValue()).isEqualTo("true");
 	}
 
 	private LifecycleObserver observer() {

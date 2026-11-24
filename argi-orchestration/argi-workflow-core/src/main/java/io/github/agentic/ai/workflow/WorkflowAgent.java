@@ -34,7 +34,9 @@ import io.github.agentic.ai.api.tool.Tool;
 import io.github.agentic.ai.api.tool.ToolContext;
 import io.github.agentic.ai.api.tool.ToolRegistry;
 import io.github.agentic.ai.api.tool.ToolResult;
+import io.github.agentic.ai.agent.lifecycle.AttemptId;
 import io.github.agentic.ai.agent.lifecycle.InvocationId;
+import io.github.agentic.ai.agent.lifecycle.LifecycleEmissions;
 import io.github.agentic.ai.agent.lifecycle.LifecycleEvent;
 import io.github.agentic.ai.agent.lifecycle.LifecycleIdentity;
 import io.github.agentic.ai.agent.lifecycle.LifecycleObserver;
@@ -305,32 +307,67 @@ public final class WorkflowAgent implements Agent {
 		}
 
 		private void runSafely() {
+			// Run-level metrics semantics (issue #317): exactly one RUN_START enter and
+			// one TERMINATION exit per delivery, with the terminal kind carried as the
+			// exit reason (completed / suspended / cancelled / failed) so the metrics
+			// observer can keep the in-flight gauge honest without trace sampling.
+			emitRunEvent(true, "started");
+			String terminal;
+			Throwable failure = null;
 			try {
 				ExecutionResult result = run();
-				if (!cancelled) {
-					if (result.suspension != null) {
-						String token = register(result.continuation);
-						AgentOutcome outcome = new AgentOutcome(AgentOutcome.Status.SUSPENDED, result.data.messages,
-								result.data.state, result.data.usage(),
-								new AgentOutcome.Suspension(token, result.suspension.prompts()));
-						emit(new AgentEvent.Finished(outcome));
-					}
-					else {
-						// The output boundary: a completed delivery must match the declared
-						// output schema, whatever path (fresh run or resume) produced it.
-						validate(result.data.state, outputSchema, "output");
-						AgentOutcome outcome = AgentOutcome.completed(result.data.messages, result.data.state,
-								result.data.usage());
-						emit(new AgentEvent.Finished(outcome));
-					}
-					subscriber.onComplete();
+				if (result.suspension != null) {
+					String token = register(result.continuation);
+					AgentOutcome outcome = new AgentOutcome(AgentOutcome.Status.SUSPENDED, result.data.messages,
+							result.data.state, result.data.usage(),
+							new AgentOutcome.Suspension(token, result.suspension.prompts()));
+					emit(new AgentEvent.Finished(outcome));
+					terminal = "suspended";
+				}
+				else {
+					// The output boundary: a completed delivery must match the declared
+					// output schema, whatever path (fresh run or resume) produced it.
+					validate(result.data.state, outputSchema, "output");
+					AgentOutcome outcome = AgentOutcome.completed(result.data.messages, result.data.state,
+							result.data.usage());
+					emit(new AgentEvent.Finished(outcome));
+					terminal = "completed";
 				}
 			}
 			catch (Throwable error) {
-				if (!cancelled) {
-					subscriber.onError(error);
+				terminal = cancelled ? "cancelled" : "failed";
+				failure = error;
+			}
+			// The terminal event precedes the caller signal: a completed future observes
+			// the run already out of flight, and the cancellation path still reports its
+			// TERMINATION instead of failing silently.
+			emitRunEvent(false, terminal);
+			if (!cancelled) {
+				if (failure == null) {
+					subscriber.onComplete();
+				}
+				else {
+					subscriber.onError(failure);
 				}
 			}
+		}
+
+		private void emitRunEvent(boolean entered, String kind) {
+			LifecycleStage stage = entered ? LifecycleStage.RUN_START : LifecycleStage.TERMINATION;
+			List<LifecycleObserver> bound = LifecycleEmissions.bound(observers, stage);
+			if (bound.isEmpty()) {
+				return;
+			}
+			LifecycleIdentity identity = runIdentity();
+			LifecycleEvent event = entered
+					? new LifecycleEvent.StageEntered(LifecycleStage.RUN_START, identity)
+					: new LifecycleEvent.StageExited(LifecycleStage.TERMINATION, identity,
+							!"failed".equals(kind) && !"cancelled".equals(kind), kind);
+			LifecycleEmissions.emitAll(bound, event, identity);
+		}
+
+		private LifecycleIdentity runIdentity() {
+			return LifecycleIdentity.builder(runInvocation(context)).build();
 		}
 
 		private ExecutionResult run() {
@@ -465,7 +502,7 @@ public final class WorkflowAgent implements Agent {
 	private ExecutionResult doExecuteStep(WorkflowStep step, RunData data, AgentExecutionContext context) {
 		context.control().assertActive();
 		if (step instanceof WorkflowStep.Agent agent) {
-			return executeWithRetry(agent.retry(), () -> executeAgent(agent, data, context), context);
+			return executeWithRetry(agent.retry(), agent, () -> executeAgent(agent, data, context), context);
 		}
 		if (step instanceof WorkflowStep.Tool tool) {
 			return executeTool(tool, data, context);
@@ -603,7 +640,7 @@ public final class WorkflowAgent implements Agent {
 	}
 
 	private ExecutionResult executeTool(WorkflowStep.Tool step, RunData data, AgentExecutionContext context) {
-		ToolResult result = executeWithRetry(step.retry(), () -> {
+		ToolResult result = executeWithRetry(step.retry(), step, () -> {
 			Tool tool = tools.find(step.toolName())
 				.orElseThrow(() -> new WorkflowExecutionException("Unknown workflow tool: " + step.toolName()));
 			Map<String, Object> arguments = resolveMap(step.arguments(), data);
@@ -697,14 +734,31 @@ public final class WorkflowAgent implements Agent {
 		return ExecutionResult.completed(data);
 	}
 
-	private <T> T executeWithRetry(WorkflowStep.RetryPolicy policy, Operation<T> operation,
+	private <T> T executeWithRetry(WorkflowStep.RetryPolicy policy, WorkflowStep step, Operation<T> operation,
 			AgentExecutionContext context) {
 		RuntimeException failure = null;
 		for (int attempt = 1; attempt <= policy.maxAttempts(); attempt++) {
+			// Physical attempts are a dimension of their own, separate from the step-level
+			// pair: the metrics observer counts only events whose identity carries an
+			// attempt id (issue #317).
+			LifecycleIdentity attemptIdentity = LifecycleIdentity.builder(runInvocation(context))
+				.step(new StepId(step.id()))
+				.attempt(new AttemptId("attempt-" + attempt))
+				.build();
+			List<LifecycleObserver> bound = boundObservers();
+			LifecycleEmissions.emitAll(bound,
+					new LifecycleEvent.StageEntered(LifecycleStage.WORKFLOW_STEP, attemptIdentity), attemptIdentity);
 			try {
-				return operation.run();
+				T result = operation.run();
+				LifecycleEmissions.emitAll(bound, new LifecycleEvent.StageExited(LifecycleStage.WORKFLOW_STEP,
+						attemptIdentity, true, null), attemptIdentity);
+				return result;
 			}
 			catch (RuntimeException exception) {
+				LifecycleEmissions.emitAll(bound,
+						new LifecycleEvent.StageExited(LifecycleStage.WORKFLOW_STEP, attemptIdentity, false,
+								exception.getClass().getSimpleName() + ": " + exception.getMessage()),
+						attemptIdentity);
 				failure = exception;
 				if (attempt < policy.maxAttempts() && !policy.backoff().isZero()) {
 					try {

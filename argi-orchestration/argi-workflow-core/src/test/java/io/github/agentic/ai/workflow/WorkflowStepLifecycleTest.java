@@ -33,6 +33,7 @@ import io.github.agentic.ai.agent.AgentExecutionContext;
 import io.github.agentic.ai.agent.AgentOutcome;
 import io.github.agentic.ai.agent.AgentRequest;
 import io.github.agentic.ai.agent.lifecycle.LifecycleEvent;
+import io.github.agentic.ai.agent.lifecycle.LifecycleIdentity;
 import io.github.agentic.ai.agent.lifecycle.LifecycleObserver;
 import io.github.agentic.ai.agent.lifecycle.LifecycleStage;
 import io.github.agentic.ai.api.chat.ChatMessage;
@@ -49,6 +50,7 @@ import io.github.agentic.ai.runtime.execution.TrustedExecutionContext;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertIterableEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -78,7 +80,9 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertEquals(List.of("ENTER answer", "EXIT answer ok", "ENTER mark", "EXIT mark ok"), observer.events);
+		assertEquals(List.of("ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok",
+				"EXIT answer ok", "ENTER mark", "ENTER mark[attempt-1]", "EXIT mark[attempt-1] ok", "EXIT mark ok"),
+				observer.events);
 	}
 
 	@Test
@@ -108,7 +112,10 @@ class WorkflowStepLifecycleTest {
 
 		assertEquals(2, attempts.get(), "both attempts must have run");
 		// Issue #322 acceptance: each step ends exactly once, retries included.
-		assertEquals(List.of("ENTER answer", "EXIT answer failed:WorkflowExecutionException: Workflow step failed after 2 attempts"),
+		assertEquals(List.of("ENTER answer", "ENTER answer[attempt-1]",
+				"EXIT answer[attempt-1] failed:IllegalStateException: boom", "ENTER answer[attempt-2]",
+				"EXIT answer[attempt-2] failed:IllegalStateException: boom",
+				"EXIT answer failed:WorkflowExecutionException: Workflow step failed after 2 attempts"),
 				observer.events);
 	}
 
@@ -144,8 +151,9 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertTrue(observer.events.size() >= 2 && observer.events.get(0).equals("ENTER answer")
-				&& observer.events.get(1).startsWith("EXIT answer failed"),
+		assertTrue(observer.events.size() >= 4 && observer.events.get(0).equals("ENTER answer")
+				&& observer.events.get(2).startsWith("EXIT answer[attempt-1] failed:")
+				&& observer.events.get(3).startsWith("EXIT answer failed:"),
 				"the cancelled step must enter once and exit unsuccessfully: " + observer.events
 						+ " unexpected=" + observer.unexpected.get());
 	}
@@ -238,8 +246,9 @@ class WorkflowStepLifecycleTest {
 		observer.awaitExits();
 
 		// The Loop container emits its own pair around the body pairs (nested LIFO).
-		assertEquals(List.of("ENTER repeat", "ENTER toggle", "EXIT toggle ok", "ENTER toggle", "EXIT toggle ok",
-				"EXIT repeat ok"), observer.events);
+		assertEquals(List.of("ENTER repeat", "ENTER toggle", "ENTER toggle[attempt-1]",
+				"EXIT toggle[attempt-1] ok", "EXIT toggle ok", "ENTER toggle", "ENTER toggle[attempt-1]",
+				"EXIT toggle[attempt-1] ok", "EXIT toggle ok", "EXIT repeat ok"), observer.events);
 	}
 
 	@Test
@@ -275,7 +284,11 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertEquals(List.of("ENTER answer", "EXIT answer ok"), observer.events);
+		// The single step pair belongs to the fresh run; resuming the continuation
+		// does not re-execute the step, and run-level events go to RUN_START-bound
+		// observers only.
+		assertIterableEquals(List.of("ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok",
+				"EXIT answer ok"), observer.events);
 	}
 
 	@Test
@@ -301,7 +314,9 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertEquals(List.of("ENTER answer", "EXIT answer ok", "ENTER answer", "EXIT answer ok"), observer.events);
+		assertIterableEquals(List.of("ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok",
+				"EXIT answer ok", "ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok",
+				"EXIT answer ok"), observer.events);
 	}
 
 	private static Agent agent(java.util.function.Function<AgentRequest, AgentOutcome> function) {
@@ -366,8 +381,11 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertAll(() -> assertEquals(List.of("ENTER answer", "EXIT answer ok"), observer.events, "pairing intact"),
-				() -> assertEquals(1, observer.extensionFailures.size(), "the failure must be reported"),
+		assertAll(() -> assertEquals(
+				List.of("ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok", "EXIT answer ok"),
+				observer.events, "pairing intact"),
+				() -> assertEquals(2, observer.extensionFailures.size(),
+						"the attempt enter and the step enter both report the failing observer"),
 				() -> assertEquals("throwing-observer", observer.extensionFailures.get(0).extensionId()));
 	}
 
@@ -392,9 +410,11 @@ class WorkflowStepLifecycleTest {
 		}
 		observer.awaitExits();
 
-		assertAll(() -> assertEquals(List.of("ENTER answer", "EXIT answer ok"), observer.events,
-				"exactly one business exit, no synthesized failure exit"),
-				() -> assertEquals(1, observer.extensionFailures.size()));
+		assertAll(() -> assertEquals(
+				List.of("ENTER answer", "ENTER answer[attempt-1]", "EXIT answer[attempt-1] ok", "EXIT answer ok"),
+				observer.events, "exactly one business exit, no synthesized failure exit"),
+				() -> assertEquals(2, observer.extensionFailures.size(),
+						"the attempt exit and the step exit both report the failing observer"));
 	}
 
 	@Test
@@ -439,7 +459,9 @@ class WorkflowStepLifecycleTest {
 		}
 
 		void awaitExits() throws InterruptedException {
-			assertTrue(this.exitGate.await(5, TimeUnit.SECONDS), "expected exits were not recorded: " + this.events);
+			CountDownLatch gate = this.exitGate;
+			assertTrue(gate == null || gate.await(5, TimeUnit.SECONDS),
+					"expected exits were not recorded: " + this.events);
 		}
 
 		@Override
@@ -456,16 +478,20 @@ class WorkflowStepLifecycleTest {
 		public void onEvent(LifecycleEvent event) {
 			try {
 				if (event instanceof LifecycleEvent.StageEntered entered) {
-					this.events.add("ENTER " + entered.identity().step().value());
+					this.events.add("ENTER " + label(entered.stage(), entered.identity()));
 					this.threads.add(Thread.currentThread().getName());
 				}
 				else if (event instanceof LifecycleEvent.StageExited exited) {
-					this.events.add("EXIT " + exited.identity().step().value()
-							+ (exited.successful() ? " ok" : " failed:" + exited.failureReason()));
+					String detail = exited.successful()
+							? (exited.failureReason() == null ? " ok" : " " + exited.failureReason())
+							: " failed:" + exited.failureReason();
+					this.events.add("EXIT " + label(exited.stage(), exited.identity()) + detail);
 					this.threads.add(Thread.currentThread().getName());
-					java.util.function.Consumer<String> hook = this.onExit;
-					if (hook != null) {
-						hook.accept(exited.identity().step().value());
+					{
+						java.util.function.Consumer<String> hook = this.onExit;
+						if (hook != null) {
+							hook.accept(exited.identity().step() == null ? null : exited.identity().step().value());
+						}
 					}
 					CountDownLatch gate = this.exitGate;
 					if (gate != null) {
@@ -479,6 +505,17 @@ class WorkflowStepLifecycleTest {
 			catch (Throwable error) {
 				this.unexpected.compareAndSet(null, error);
 			}
+
+		}
+
+		/** Step events read {@code answer[attempt-1]}; run-level events read the stage. */
+		private static String label(LifecycleStage stage, LifecycleIdentity identity) {
+			String stageLabel = stage.name().toLowerCase().replace('_', '-');
+			if (identity.step() == null) {
+				return stageLabel;
+			}
+			String attempt = identity.attempt() == null ? "" : "[" + identity.attempt().value() + "]";
+			return identity.step().value() + attempt;
 		}
 
 	}
