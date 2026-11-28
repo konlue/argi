@@ -200,14 +200,16 @@ main() {
 		exit 2
 	fi
 
-	local tmp_parent="${TMPDIR:-/tmp}"
-	local maven_repo
+	# These are the trap-shared globals declared above; do not redeclare them local
+	# here — a local would shadow them and cleanup would read unset values after main
+	# returned, leaking the temporary repository.
+	tmp_parent="${TMPDIR:-/tmp}"
 	if [[ -n "${EXTENSIONS_COMPAT_MAVEN_REPO:-}" ]]; then
 		maven_repo="$(cd "${EXTENSIONS_COMPAT_MAVEN_REPO}" && pwd)"
-		local owned_maven_repo="0"
+		owned_maven_repo="0"
 	else
 		maven_repo="$(mktemp -d "${tmp_parent%/}/argi-extensions-compat-m2.XXXXXX")"
-		local owned_maven_repo="1"
+		owned_maven_repo="1"
 	fi
 	readonly maven_repo
 
@@ -249,8 +251,11 @@ main() {
 	echo "Resolving Extensions dependencies bound to ${GROUP_ID}:argi-*:${candidate_version}"
 	(
 		cd "${extensions_dir}"
+		# appendOutput=true is mandatory in a multi-module reactor: the default writes
+		# (truncates) the same file once per module, so only the last module's list
+		# would survive — for argi-extensions-bom that is just "none".
 		"${extensions_maven}" -B -f pom.xml -Dmaven.repo.local="${maven_repo}" -Dargi.version="${candidate_version}" \
-			dependency:list -DoutputFile="${list_file}" -DincludeScope=test
+			dependency:list -DoutputFile="${list_file}" -DappendOutput=true -DincludeScope=test
 	)
 	if ! verify_candidate_coordinates "${list_file}" "${candidate_version}"; then
 		exit 3
